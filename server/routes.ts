@@ -202,11 +202,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.put('/api/notes/:id', authenticateToken, async (req: any, res) => {
     try {
+      // First get the existing note to check ownership
+      const existingNote = await storage.getNote(req.params.id, req.user.tenantId);
+      if (!existingNote) {
+        return res.status(404).json({ message: 'Note not found' });
+      }
+
+      // Check authorization: admin can update any note in tenant, member can only update own notes
+      if (req.user.role === 'member' && existingNote.userId !== req.user.userId) {
+        console.log(`User ${req.user.email} attempted to update note ${req.params.id} owned by another user`);
+        return res.status(403).json({ message: 'You can only update your own notes' });
+      }
+
       const { title, content } = req.body;
       const note = await storage.updateNote(req.params.id, req.user.tenantId, {
         title,
         content,
-        userId: req.user.userId,
+        userId: existingNote.userId, // Keep original owner
         tenantId: req.user.tenantId
       });
 
@@ -224,6 +236,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.delete('/api/notes/:id', authenticateToken, async (req: any, res) => {
     try {
+      // First get the existing note to check ownership
+      const existingNote = await storage.getNote(req.params.id, req.user.tenantId);
+      if (!existingNote) {
+        return res.status(404).json({ message: 'Note not found' });
+      }
+
+      // Check authorization: admin can delete any note in tenant, member can only delete own notes
+      if (req.user.role === 'member' && existingNote.userId !== req.user.userId) {
+        console.log(`User ${req.user.email} attempted to delete note ${req.params.id} owned by another user`);
+        return res.status(403).json({ message: 'You can only delete your own notes' });
+      }
+
       const deleted = await storage.deleteNote(req.params.id, req.user.tenantId);
       if (!deleted) {
         return res.status(404).json({ message: 'Note not found' });
