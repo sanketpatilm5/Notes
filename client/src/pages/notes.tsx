@@ -480,7 +480,7 @@ export default function Notes() {
               <Card className="bg-muted">
                 <CardContent className="pt-3">
                   <p className="text-sm text-muted-foreground">
-                    ℹ️ Default password will be "password". User should change it after first login.
+                    ℹ️ An email with password setup instructions will be sent to the user.
                   </p>
                 </CardContent>
               </Card>

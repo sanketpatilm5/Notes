@@ -5,7 +5,12 @@ import jwt from "jsonwebtoken";
 import bcryptjs from "bcryptjs";
 import { z } from "zod";
 
-const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error('JWT_SECRET environment variable is required');
+}
+// Ensure TypeScript knows JWT_SECRET is defined
+const secretKey: string = JWT_SECRET;
 
 // CORS middleware
 const setCORSHeaders = (res: any) => {
@@ -30,7 +35,7 @@ const authenticateToken = async (req: any, res: any, next: any) => {
   }
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET) as any;
+    const decoded = jwt.verify(token, secretKey) as any;
     req.user = decoded;
     next();
   } catch (error) {
@@ -83,7 +88,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         role: user.role,
         tenantId: tenant.id,
         tenantSlug: tenant.slug
-      }, JWT_SECRET, { expiresIn: '7d' });
+      }, secretKey, { expiresIn: '7d' });
 
       console.log('Login successful for:', email);
       res.json({ token });
@@ -93,9 +98,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Seed endpoint
-  app.post('/api/auth/seed', async (req, res) => {
-    setCORSHeaders(res);
+  // Seed endpoint - protected for security
+  app.post('/api/auth/seed', authenticateToken, async (req: any, res) => {
+    // Only admin users can seed the database
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ message: 'Admin access required' });
+    }
+    
     console.log('Seeding database...');
     
     try {
@@ -120,12 +129,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
         console.log('Created Globex tenant');
       }
 
+      // Generate secure random passwords for seeded users
+      const crypto = await import('crypto');
+      const generateSecurePassword = () => crypto.randomBytes(16).toString('hex');
+
       // Create users
       const usersToCreate = [
-        { email: 'admin@acme.test', password: 'password', role: 'admin', tenantId: acmeTenant.id },
-        { email: 'user@acme.test', password: 'password', role: 'member', tenantId: acmeTenant.id },
-        { email: 'admin@globex.test', password: 'password', role: 'admin', tenantId: globexTenant.id },
-        { email: 'user@globex.test', password: 'password', role: 'member', tenantId: globexTenant.id },
+        { email: 'admin@acme.test', password: generateSecurePassword(), role: 'admin', tenantId: acmeTenant.id },
+        { email: 'user@acme.test', password: generateSecurePassword(), role: 'member', tenantId: acmeTenant.id },
+        { email: 'admin@globex.test', password: generateSecurePassword(), role: 'admin', tenantId: globexTenant.id },
+        { email: 'user@globex.test', password: generateSecurePassword(), role: 'member', tenantId: globexTenant.id },
       ];
 
       for (const userData of usersToCreate) {
@@ -301,18 +314,123 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ message: 'User already exists' });
       }
 
+      // Generate a secure random password reset token for new user
+      const crypto = await import('crypto');
+      const resetToken = crypto.randomBytes(32).toString('hex');
+      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+
+      // Create user with temporary password
       const newUser = await storage.createUser({
         email,
-        password: 'password',
+        password: 'temp-password-' + crypto.randomBytes(8).toString('hex'),
         role,
         tenantId: req.user.tenantId
       });
 
-      console.log(`Invited user ${email} to tenant ${req.params.slug}`);
-      res.status(201).json({ message: 'User invited successfully', userId: newUser.id });
+      // Create password reset token for initial password setup
+      await storage.createPasswordResetToken({
+        token: resetToken,
+        userId: newUser.id,
+        expiresAt,
+        used: false
+      });
+
+      console.log(`Invited user ${email} to tenant ${req.params.slug} with reset token`);
+      // In production, the resetToken would be sent via email instead of being returned
+      res.status(201).json({ 
+        message: 'User invited successfully. Password reset token created.', 
+        userId: newUser.id
+        // passwordResetToken removed from response to prevent token leakage
+      });
     } catch (error) {
       console.error('Invite user error:', error);
       res.status(500).json({ message: 'Failed to invite user' });
+    }
+  });
+
+  // Request password reset endpoint
+  app.post('/api/auth/request-reset', async (req, res) => {
+    setCORSHeaders(res);
+    
+    try {
+      const { email } = req.body;
+      
+      if (!email) {
+        return res.status(400).json({ message: 'Email is required' });
+      }
+
+      const user = await storage.getUserByEmail(email);
+      if (!user) {
+        // Don't reveal if email exists for security reasons
+        return res.json({ message: 'If the email exists, a reset link will be sent.' });
+      }
+
+      // Generate secure reset token
+      const crypto = await import('crypto');
+      const resetToken = crypto.randomBytes(32).toString('hex');
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+      // Clean up old tokens for this user
+      await storage.cleanupExpiredTokens();
+      
+      // Create new reset token
+      await storage.createPasswordResetToken({
+        token: resetToken,
+        userId: user.id,
+        expiresAt,
+        used: false
+      });
+
+      console.log(`Password reset requested for ${email}`);
+      // In production, you would send an email here
+      res.json({ 
+        message: 'If the email exists, a reset link will be sent.',
+        // For development only - remove in production
+        resetToken: resetToken 
+      });
+    } catch (error) {
+      console.error('Request password reset error:', error);
+      res.status(500).json({ message: 'Failed to process reset request' });
+    }
+  });
+
+  // Reset password endpoint
+  app.post('/api/auth/reset-password', async (req, res) => {
+    setCORSHeaders(res);
+    
+    try {
+      const { token, newPassword } = req.body;
+      
+      if (!token || !newPassword) {
+        return res.status(400).json({ message: 'Token and new password are required' });
+      }
+
+      if (newPassword.length < 6) {
+        return res.status(400).json({ message: 'Password must be at least 6 characters long' });
+      }
+
+      // Get the reset token
+      const resetToken = await storage.getPasswordResetToken(token);
+      if (!resetToken) {
+        return res.status(400).json({ message: 'Invalid or expired reset token' });
+      }
+
+      // Check if token is expired or already used
+      if (resetToken.used || resetToken.expiresAt < new Date()) {
+        return res.status(400).json({ message: 'Invalid or expired reset token' });
+      }
+
+      // Update the user's password
+      await storage.updateUserPassword(resetToken.userId, newPassword);
+      
+      // Mark token as used
+      await storage.markTokenAsUsed(resetToken.id);
+
+      console.log(`Password reset successfully for user ${resetToken.userId}`);
+      res.json({ message: 'Password reset successfully' });
+    } catch (error) {
+      console.error('Reset password error:', error);
+      res.status(500).json({ message: 'Failed to reset password' });
     }
   });
 
