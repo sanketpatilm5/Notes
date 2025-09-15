@@ -51,7 +51,7 @@ app.use((req, res, next) => {
     await setupVite(app, server);
   } else {
     // In production (Vercel), serve built React app
-    const clientDist = path.join(__dirname, "..", "client", "dist", "public");
+    const clientDist = path.join(__dirname, "..", "dist", "public");
     console.log("Serving static from:", clientDist);
 
     app.use(express.static(clientDist));
@@ -67,26 +67,35 @@ app.use((req, res, next) => {
     });
   }
 
-  // Serve API + client on same port
   const port = parseInt(process.env.PORT || '5000', 10);
-  const listenOptions: any = { port, host: "0.0.0.0" };
-  if (process.platform !== 'win32') {
-    listenOptions.reusePort = true;
-  }
-  server.listen(listenOptions, () => {
-    log(`serving on port ${port}`);
-  });
 
-  // Optionally run DB seed
-  if (process.env.SEED_DB === 'true') {
-    (async () => {
-      try {
-        console.log('SEED_DB=true — seeding database now...');
-        await seedDatabase();
-        console.log('Seeding complete.');
-      } catch (e) {
-        console.error('Seeding failed:', e);
-      }
-    })();
+  // --- Key change: Export handler for Vercel instead of always listening ---
+  if (process.env.VERCEL === '1' || process.env.VERCEL === 'true') {
+    // For Vercel serverless: export app
+    module.exports = app;
+    // also export default for ESM
+    export default app;
+    log("Exported Express app for Vercel serverless");
+  } else {
+    // Local/dev run: start server
+    const listenOptions: any = { port, host: "0.0.0.0" };
+    if (process.platform !== 'win32') {
+      listenOptions.reusePort = true;
+    }
+    server.listen(listenOptions, () => {
+      log(`serving on port ${port}`);
+    });
+
+    if (process.env.SEED_DB === 'true') {
+      (async () => {
+        try {
+          console.log('SEED_DB=true — seeding database now...');
+          await seedDatabase();
+          console.log('Seeding complete.');
+        } catch (e) {
+          console.error('Seeding failed:', e);
+        }
+      })();
+    }
   }
 })();
