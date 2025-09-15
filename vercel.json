@@ -1,12 +1,26 @@
 {
-  "rewrites": [
+  "version": 2,
+  "builds": [
     {
-      "source": "/health",
-      "destination": "/api/health"
+      "src": "package.json",
+      "use": "@vercel/node"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "/server/index.ts"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/client/dist/public/$1"
     }
   ],
   "functions": {
-    "server/index.ts": {
+    "server/**/*.ts": {
+      "runtime": "nodejs18.x"
+    },
+    "server/**/*.js": {
       "runtime": "nodejs18.x"
     }
   }
