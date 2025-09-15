@@ -1,0 +1,479 @@
+import type { Express } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage";
+import jwt from "jsonwebtoken";
+import bcryptjs from "bcryptjs";
+import { z } from "zod";
+
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error('JWT_SECRET environment variable is required');
+}
+// Ensure TypeScript knows JWT_SECRET is defined
+const secretKey: string = JWT_SECRET;
+
+
+/**
+ * Programmatic database seeding function.
+ * Creates two tenants (acme, globex), four users and sample notes.
+ * Uses SEED_PASSWORD env var or defaults to 'password' (for testing only).
+ */
+export async function seedDatabase() {
+  try {
+    // Create tenants
+    const existingAcme = await storage.getTenantBySlug('acme');
+    const existingGlobex = await storage.getTenantBySlug('globex');
+    let acmeTenant = existingAcme;
+    let globexTenant = existingGlobex;
+    if (!acmeTenant) {
+      acmeTenant = await storage.createTenant({ name: 'Acme', slug: 'acme', plan: 'free' });
+      console.log('Created tenant acme');
+    }
+    if (!globexTenant) {
+      globexTenant = await storage.createTenant({ name: 'Globex', slug: 'globex', plan: 'free' });
+      console.log('Created tenant globex');
+    }
+
+    // Use SEED_PASSWORD env var if provided, otherwise default to 'password'
+    const seedPassword = process.env.SEED_PASSWORD || 'password';
+
+    const usersToCreate = [
+      { email: 'admin@acme.test', password: seedPassword, role: 'admin', tenantId: acmeTenant.id },
+      { email: 'user@acme.test', password: seedPassword, role: 'member', tenantId: acmeTenant.id },
+      { email: 'admin@globex.test', password: seedPassword, role: 'admin', tenantId: globexTenant.id },
+      { email: 'user@globex.test', password: seedPassword, role: 'member', tenantId: globexTenant.id },
+    ];
+
+    for (const userData of usersToCreate) {
+      const existingUser = await storage.getUserByEmail(userData.email);
+      if (!existingUser) {
+        await storage.createUser(userData);
+        console.log('Created user:', userData.email, 'password:', seedPassword);
+      } else {
+        console.log('User already exists:', userData.email);
+      }
+    }
+
+    // Create a sample note for acme if none exists
+    const acmeNotes = await storage.getNotes(acmeTenant.id);
+    if (acmeNotes.length === 0) {
+      await storage.createNote({
+        tenantId: acmeTenant.id,
+        title: 'Welcome to Acme',
+        content: 'This is a seeded note.',
+      });
+      console.log('Created sample note for acme');
+    }
+
+    return true;
+  } catch (err) {
+    console.error('seedDatabase error', err);
+    throw err;
+  }
+}
+
+
+// CORS middleware
+const setCORSHeaders = (res: any) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+};
+
+// Centralized server error handler (logs stack and returns details in dev)
+const handleServerError = (res: any, context: string, error: any) => {
+  console.error(`${context} error:`, error?.stack || error);
+  if (process.env.NODE_ENV === 'development') {
+    return res.status(500).json({ message: error?.message || 'Internal server error', stack: error?.stack || String(error) });
+  }
+  return res.status(500).json({ message: 'Internal server error' });
+};
+
+// Auth middleware
+const authenticateToken = async (req: any, res: any, next: any) => {
+  setCORSHeaders(res);
+  
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ message: 'Access token required' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, secretKey) as any;
+    req.user = decoded;
+    next();
+  } catch (error) {
+    console.log('JWT verification failed:', error);
+    return res.status(403).json({ message: 'Invalid token' });
+  }
+};
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Health endpoint
+  app.get('/api/health', (req, res) => {
+    setCORSHeaders(res);
+    res.json({ status: 'ok' });
+  });
+
+  app.get('/health', (req, res) => {
+    setCORSHeaders(res);
+    res.json({ status: 'ok' });
+  });
+
+  // Login endpoint
+  app.post('/api/auth/login', async (req, res) => {
+    setCORSHeaders(res);
+    console.log('Login attempt:', req.body.email);
+    
+    try {
+      const { email, password } = req.body;
+      
+      const user = await storage.getUserByEmail(email);
+      if (!user) {
+        console.log('User not found:', email);
+        return res.status(401).json({ message: 'Invalid credentials' });
+      }
+
+      const passwordMatch = bcryptjs.compareSync(password, user.password);
+      if (!passwordMatch) {
+        console.log('Password mismatch for user:', email);
+        return res.status(401).json({ message: 'Invalid credentials' });
+      }
+
+      const tenant = await storage.getTenant(user.tenantId);
+      if (!tenant) {
+        console.log('Tenant not found for user:', email);
+        return res.status(500).json({ message: 'Tenant not found' });
+      }
+
+      const token = jwt.sign({
+        userId: user.id,
+        email: user.email,
+        role: user.role,
+        tenantId: tenant.id,
+        tenantSlug: tenant.slug
+      }, secretKey, { expiresIn: '7d' });
+
+      console.log('Login successful for:', email);
+      res.json({ token });
+    } catch (error: any) {
+      return handleServerError(res, 'Login', error);
+    }
+  });
+
+  // Seed endpoint - protected for security
+  app.post('/api/auth/seed', authenticateToken, async (req: any, res) => {
+    // Only admin users can seed the database
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ message: 'Admin access required' });
+    }
+    
+    console.log('Seeding database...');
+    
+    try {
+      // Create tenants
+      let acmeTenant = await storage.getTenantBySlug('acme');
+      if (!acmeTenant) {
+        acmeTenant = await storage.createTenant({
+          name: 'ACME Corp',
+          slug: 'acme',
+          plan: 'free'
+        });
+        console.log('Created ACME tenant');
+      }
+
+      let globexTenant = await storage.getTenantBySlug('globex');
+      if (!globexTenant) {
+        globexTenant = await storage.createTenant({
+          name: 'Globex Inc',
+          slug: 'globex',
+          plan: 'free'
+        });
+        console.log('Created Globex tenant');
+      }
+
+      await seedDatabase();
+      res.json({ message: 'Database seeded successfully' });
+    } catch (error: any) {
+      return handleServerError(res, 'Seed', error);
+    }
+  });
+
+  // Notes endpoints
+  app.get('/api/notes', authenticateToken, async (req: any, res) => {
+    try {
+      const notes = await storage.getNotes(req.user.tenantId);
+      console.log(`Retrieved ${notes.length} notes for tenant ${req.user.tenantSlug}`);
+      res.json(notes);
+    } catch (error: any) {
+      return handleServerError(res, 'Get notes', error);
+    }
+  });
+
+  app.get('/api/notes/:id', authenticateToken, async (req: any, res) => {
+    try {
+      const note = await storage.getNote(req.params.id, req.user.tenantId);
+      if (!note) {
+        return res.status(404).json({ message: 'Note not found' });
+      }
+      res.json(note);
+    } catch (error: any) {
+      return handleServerError(res, 'Get note', error);
+    }
+  });
+
+  app.post('/api/notes', authenticateToken, async (req: any, res) => {
+    try {
+      const tenant = await storage.getTenant(req.user.tenantId);
+      if (!tenant) {
+        return res.status(404).json({ message: 'Tenant not found' });
+      }
+
+      // Check plan limits
+      if (tenant.plan === 'free') {
+        const notesCount = await storage.getNotesCount(req.user.tenantId);
+        if (notesCount >= 3) {
+          console.log(`Free plan limit reached for tenant ${req.user.tenantSlug}`);
+          return res.status(403).json({ message: 'Free plan limit reached. Upgrade to Pro for unlimited notes.' });
+        }
+      }
+
+      const { title, content } = req.body;
+      const note = await storage.createNote({
+        title,
+        content,
+        userId: req.user.userId,
+        tenantId: req.user.tenantId
+      });
+
+      console.log(`Created note "${title}" for user ${req.user.email}`);
+      res.status(201).json(note);
+    } catch (error: any) {
+      return handleServerError(res, 'Create note', error);
+    }
+  });
+
+  app.put('/api/notes/:id', authenticateToken, async (req: any, res) => {
+    try {
+      // First get the existing note to check ownership
+      const existingNote = await storage.getNote(req.params.id, req.user.tenantId);
+      if (!existingNote) {
+        return res.status(404).json({ message: 'Note not found' });
+      }
+
+      // Check authorization: admin can update any note in tenant, member can only update own notes
+      if (req.user.role === 'member' && existingNote.userId !== req.user.userId) {
+        console.log(`User ${req.user.email} attempted to update note ${req.params.id} owned by another user`);
+        return res.status(403).json({ message: 'You can only update your own notes' });
+      }
+
+      const { title, content } = req.body;
+      const note = await storage.updateNote(req.params.id, req.user.tenantId, {
+        title,
+        content,
+        userId: existingNote.userId, // Keep original owner
+        tenantId: req.user.tenantId
+      });
+
+      if (!note) {
+        return res.status(404).json({ message: 'Note not found' });
+      }
+
+      console.log(`Updated note ${req.params.id} for user ${req.user.email}`);
+      res.json(note);
+    } catch (error: any) {
+      return handleServerError(res, 'Update note', error);
+    }
+  });
+
+  app.delete('/api/notes/:id', authenticateToken, async (req: any, res) => {
+    try {
+      // First get the existing note to check ownership
+      const existingNote = await storage.getNote(req.params.id, req.user.tenantId);
+      if (!existingNote) {
+        return res.status(404).json({ message: 'Note not found' });
+      }
+
+      // Check authorization: admin can delete any note in tenant, member can only delete own notes
+      if (req.user.role === 'member' && existingNote.userId !== req.user.userId) {
+        console.log(`User ${req.user.email} attempted to delete note ${req.params.id} owned by another user`);
+        return res.status(403).json({ message: 'You can only delete your own notes' });
+      }
+
+      const deleted = await storage.deleteNote(req.params.id, req.user.tenantId);
+      if (!deleted) {
+        return res.status(404).json({ message: 'Note not found' });
+      }
+
+      console.log(`Deleted note ${req.params.id} for user ${req.user.email}`);
+      res.json({ message: 'Note deleted successfully' });
+    } catch (error: any) {
+      return handleServerError(res, 'Delete note', error);
+    }
+  });
+
+  // Upgrade tenant endpoint
+  app.post('/api/tenants/:slug/upgrade', authenticateToken, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: 'Admin role required' });
+      }
+
+      const tenant = await storage.getTenantBySlug(req.params.slug);
+      if (!tenant || tenant.id !== req.user.tenantId) {
+        return res.status(404).json({ message: 'Tenant not found or access denied' });
+      }
+
+      const upgradedTenant = await storage.upgradeTenant(tenant.id);
+      console.log(`Upgraded tenant ${req.params.slug} to Pro plan`);
+      res.json(upgradedTenant);
+    } catch (error: any) {
+      return handleServerError(res, 'Upgrade tenant', error);
+    }
+  });
+
+  // Invite user endpoint
+  app.post('/api/tenants/:slug/invite', authenticateToken, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: 'Admin role required' });
+      }
+
+      const tenant = await storage.getTenantBySlug(req.params.slug);
+      if (!tenant || tenant.id !== req.user.tenantId) {
+        return res.status(404).json({ message: 'Tenant not found or access denied' });
+      }
+
+      const { email, role = 'member' } = req.body;
+      
+      const existingUser = await storage.getUserByEmail(email);
+      if (existingUser) {
+        return res.status(400).json({ message: 'User already exists' });
+      }
+
+      // Generate a secure random password reset token for new user
+      const crypto = await import('crypto');
+      const resetToken = crypto.randomBytes(32).toString('hex');
+      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+
+      // Create user with temporary password
+      const newUser = await storage.createUser({
+        email,
+        password: 'temp-password-' + crypto.randomBytes(8).toString('hex'),
+        role,
+        tenantId: req.user.tenantId
+      });
+
+      // Create password reset token for initial password setup
+      await storage.createPasswordResetToken({
+        token: resetToken,
+        userId: newUser.id,
+        expiresAt,
+        used: false
+      });
+
+      console.log(`Invited user ${email} to tenant ${req.params.slug} with reset token`);
+      // In production, the resetToken would be sent via email instead of being returned
+      res.status(201).json({ 
+        message: 'User invited successfully. Password reset token created.', 
+        userId: newUser.id
+        // passwordResetToken removed from response to prevent token leakage
+      });
+    } catch (error: any) {
+      return handleServerError(res, 'Invite user', error);
+    }
+  });
+
+  // Request password reset endpoint
+  app.post('/api/auth/request-reset', async (req, res) => {
+    setCORSHeaders(res);
+    
+    try {
+      const { email } = req.body;
+      
+      if (!email) {
+        return res.status(400).json({ message: 'Email is required' });
+      }
+
+      const user = await storage.getUserByEmail(email);
+      if (!user) {
+        // Don't reveal if email exists for security reasons
+        return res.json({ message: 'If the email exists, a reset link will be sent.' });
+      }
+
+      // Generate secure reset token
+      const crypto = await import('crypto');
+      const resetToken = crypto.randomBytes(32).toString('hex');
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+      // Clean up old tokens for this user
+      await storage.cleanupExpiredTokens();
+      
+      // Create new reset token
+      await storage.createPasswordResetToken({
+        token: resetToken,
+        userId: user.id,
+        expiresAt,
+        used: false
+      });
+
+      console.log(`Password reset requested for ${email}`);
+      // In production, you would send an email here
+      res.json({ 
+        message: 'If the email exists, a reset link will be sent.',
+        // For development only - remove in production
+        resetToken: resetToken 
+      });
+    } catch (error: any) {
+      return handleServerError(res, 'Request password reset', error);
+    }
+  });
+
+  // Reset password endpoint
+  app.post('/api/auth/reset-password', async (req, res) => {
+    setCORSHeaders(res);
+    
+    try {
+      const { token, newPassword } = req.body;
+      
+      if (!token || !newPassword) {
+        return res.status(400).json({ message: 'Token and new password are required' });
+      }
+
+      if (newPassword.length < 6) {
+        return res.status(400).json({ message: 'Password must be at least 6 characters long' });
+      }
+
+      // Get the reset token
+      const resetToken = await storage.getPasswordResetToken(token);
+      if (!resetToken) {
+        return res.status(400).json({ message: 'Invalid or expired reset token' });
+      }
+
+      // Check if token is expired or already used
+      if (resetToken.used || resetToken.expiresAt < new Date()) {
+        return res.status(400).json({ message: 'Invalid or expired reset token' });
+      }
+
+      // Update the user's password
+      await storage.updateUserPassword(resetToken.userId, newPassword);
+      
+      // Mark token as used
+      await storage.markTokenAsUsed(resetToken.id);
+
+      console.log(`Password reset successfully for user ${resetToken.userId}`);
+      res.json({ message: 'Password reset successfully' });
+    } catch (error: any) {
+      return handleServerError(res, 'Reset password', error);
+    }
+  });
+
+  const httpServer = createServer(app);
+  return httpServer;
+}

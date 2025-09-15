@@ -12,11 +12,72 @@ if (!JWT_SECRET) {
 // Ensure TypeScript knows JWT_SECRET is defined
 const secretKey: string = JWT_SECRET;
 
+
+/**
+ * Programmatic database seeding function.
+ * Creates two tenants (acme, globex), four users and sample notes.
+ * Uses SEED_PASSWORD env var or defaults to 'password' (for testing only).
+ */
+export async function seedDatabase() {
+  try {
+    // Create tenants
+    const existingAcme = await storage.getTenantBySlug('acme');
+    const existingGlobex = await storage.getTenantBySlug('globex');
+    let acmeTenant = existingAcme;
+    let globexTenant = existingGlobex;
+    if (!acmeTenant) {
+      acmeTenant = await storage.createTenant({ name: 'Acme', slug: 'acme', plan: 'free' });
+      console.log('Created tenant acme');
+    }
+    if (!globexTenant) {
+      globexTenant = await storage.createTenant({ name: 'Globex', slug: 'globex', plan: 'free' });
+      console.log('Created tenant globex');
+    }
+
+    // Use SEED_PASSWORD env var if provided, otherwise default to 'password'
+    const seedPassword = process.env.SEED_PASSWORD || 'password';
+
+    const usersToCreate = [
+      { email: 'admin@acme.test', password: seedPassword, role: 'admin', tenantId: acmeTenant.id },
+      { email: 'user@acme.test', password: seedPassword, role: 'member', tenantId: acmeTenant.id },
+      { email: 'admin@globex.test', password: seedPassword, role: 'admin', tenantId: globexTenant.id },
+      { email: 'user@globex.test', password: seedPassword, role: 'member', tenantId: globexTenant.id },
+    ];
+
+    for (const userData of usersToCreate) {
+      const existingUser = await storage.getUserByEmail(userData.email);
+      if (!existingUser) {
+        await storage.createUser(userData);
+        console.log('Created user:', userData.email, 'password:', seedPassword);
+      } else {
+        console.log('User already exists:', userData.email);
+      }
+    }
+
+    // Create a sample note for acme if none exists
+    
+    return true;
+  } catch (err) {
+    console.error('seedDatabase error', err);
+    throw err;
+  }
+}
+
+
 // CORS middleware
 const setCORSHeaders = (res: any) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+};
+
+// Centralized server error handler (logs stack and returns details in dev)
+const handleServerError = (res: any, context: string, error: any) => {
+  console.error(`${context} error:`, error?.stack || error);
+  if (process.env.NODE_ENV === 'development') {
+    return res.status(500).json({ message: error?.message || 'Internal server error', stack: error?.stack || String(error) });
+  }
+  return res.status(500).json({ message: 'Internal server error' });
 };
 
 // Auth middleware
@@ -92,9 +153,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       console.log('Login successful for:', email);
       res.json({ token });
-    } catch (error) {
-      console.error('Login error:', error);
-      res.status(500).json({ message: 'Internal server error' });
+    } catch (error: any) {
+      return handleServerError(res, 'Login', error);
     }
   });
 
@@ -129,44 +189,37 @@ export async function registerRoutes(app: Express): Promise<Server> {
         console.log('Created Globex tenant');
       }
 
-      // Generate secure random passwords for seeded users
-      const crypto = await import('crypto');
-      const generateSecurePassword = () => crypto.randomBytes(16).toString('hex');
-
-      // Create users
-      const usersToCreate = [
-        { email: 'admin@acme.test', password: generateSecurePassword(), role: 'admin', tenantId: acmeTenant.id },
-        { email: 'user@acme.test', password: generateSecurePassword(), role: 'member', tenantId: acmeTenant.id },
-        { email: 'admin@globex.test', password: generateSecurePassword(), role: 'admin', tenantId: globexTenant.id },
-        { email: 'user@globex.test', password: generateSecurePassword(), role: 'member', tenantId: globexTenant.id },
-      ];
-
-      for (const userData of usersToCreate) {
-        const existingUser = await storage.getUserByEmail(userData.email);
-        if (!existingUser) {
-          await storage.createUser(userData);
-          console.log('Created user:', userData.email);
-        }
-      }
-
+      await seedDatabase();
       res.json({ message: 'Database seeded successfully' });
-    } catch (error) {
-      console.error('Seed error:', error);
-      res.status(500).json({ message: 'Seeding failed' });
+    } catch (error: any) {
+      return handleServerError(res, 'Seed', error);
     }
   });
 
   // Notes endpoints
-  app.get('/api/notes', authenticateToken, async (req: any, res) => {
-    try {
-      const notes = await storage.getNotes(req.user.tenantId);
-      console.log(`Retrieved ${notes.length} notes for tenant ${req.user.tenantSlug}`);
-      res.json(notes);
-    } catch (error) {
-      console.error('Get notes error:', error);
-      res.status(500).json({ message: 'Failed to fetch notes' });
+  
+app.get('/api/notes', authenticateToken, async (req: any, res) => {
+  try {
+    // Ensure tenant exists
+    const tenant = await storage.getTenant(req.user.tenantId);
+    if (!tenant) {
+      return res.status(404).json({ message: 'Tenant not found' });
     }
-  });
+
+    // Return only notes created by the requesting user
+    const notes = await storage.getNotesByUser(req.user.tenantId, req.user.userId);
+
+    // Optional: attach ownerEmail if storage returns it (safe)
+    const normalized = notes.map((n: any) => ({
+      ...n,
+      ownerEmail: n.ownerEmail || req.user.email,
+    }));
+
+    return res.json(normalized);
+  } catch (error: any) {
+    return handleServerError(res, 'Get notes', error);
+  }
+});
 
   app.get('/api/notes/:id', authenticateToken, async (req: any, res) => {
     try {
@@ -174,10 +227,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (!note) {
         return res.status(404).json({ message: 'Note not found' });
       }
+      if (note.userId !== req.user.userId) {
+        // Hide note existence from other users
+        return res.status(404).json({ message: 'Note not found' });
+      }
       res.json(note);
-    } catch (error) {
-      console.error('Get note error:', error);
-      res.status(500).json({ message: 'Failed to fetch note' });
+    } catch (error: any) {
+      return handleServerError(res, 'Get note', error);
     }
   });
 
@@ -207,9 +263,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       console.log(`Created note "${title}" for user ${req.user.email}`);
       res.status(201).json(note);
-    } catch (error) {
-      console.error('Create note error:', error);
-      res.status(500).json({ message: 'Failed to create note' });
+    } catch (error: any) {
+      return handleServerError(res, 'Create note', error);
     }
   });
 
@@ -221,8 +276,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(404).json({ message: 'Note not found' });
       }
 
-      // Check authorization: admin can update any note in tenant, member can only update own notes
-      if (req.user.role === 'member' && existingNote.userId !== req.user.userId) {
+      // Check authorization: only the note owner can update the note
+      if (existingNote.userId !== req.user.userId) {
         console.log(`User ${req.user.email} attempted to update note ${req.params.id} owned by another user`);
         return res.status(403).json({ message: 'You can only update your own notes' });
       }
@@ -241,9 +296,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       console.log(`Updated note ${req.params.id} for user ${req.user.email}`);
       res.json(note);
-    } catch (error) {
-      console.error('Update note error:', error);
-      res.status(500).json({ message: 'Failed to update note' });
+    } catch (error: any) {
+      return handleServerError(res, 'Update note', error);
     }
   });
 
@@ -255,8 +309,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(404).json({ message: 'Note not found' });
       }
 
-      // Check authorization: admin can delete any note in tenant, member can only delete own notes
-      if (req.user.role === 'member' && existingNote.userId !== req.user.userId) {
+      // Check authorization: only the note owner can delete the note
+      if (existingNote.userId !== req.user.userId) {
         console.log(`User ${req.user.email} attempted to delete note ${req.params.id} owned by another user`);
         return res.status(403).json({ message: 'You can only delete your own notes' });
       }
@@ -268,9 +322,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       console.log(`Deleted note ${req.params.id} for user ${req.user.email}`);
       res.json({ message: 'Note deleted successfully' });
-    } catch (error) {
-      console.error('Delete note error:', error);
-      res.status(500).json({ message: 'Failed to delete note' });
+    } catch (error: any) {
+      return handleServerError(res, 'Delete note', error);
     }
   });
 
@@ -289,9 +342,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const upgradedTenant = await storage.upgradeTenant(tenant.id);
       console.log(`Upgraded tenant ${req.params.slug} to Pro plan`);
       res.json(upgradedTenant);
-    } catch (error) {
-      console.error('Upgrade tenant error:', error);
-      res.status(500).json({ message: 'Failed to upgrade tenant' });
+    } catch (error: any) {
+      return handleServerError(res, 'Upgrade tenant', error);
     }
   });
 
@@ -342,9 +394,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         userId: newUser.id
         // passwordResetToken removed from response to prevent token leakage
       });
-    } catch (error) {
-      console.error('Invite user error:', error);
-      res.status(500).json({ message: 'Failed to invite user' });
+    } catch (error: any) {
+      return handleServerError(res, 'Invite user', error);
     }
   });
 
@@ -388,9 +439,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         // For development only - remove in production
         resetToken: resetToken 
       });
-    } catch (error) {
-      console.error('Request password reset error:', error);
-      res.status(500).json({ message: 'Failed to process reset request' });
+    } catch (error: any) {
+      return handleServerError(res, 'Request password reset', error);
     }
   });
 
@@ -428,9 +478,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       console.log(`Password reset successfully for user ${resetToken.userId}`);
       res.json({ message: 'Password reset successfully' });
-    } catch (error) {
-      console.error('Reset password error:', error);
-      res.status(500).json({ message: 'Failed to reset password' });
+    } catch (error: any) {
+      return handleServerError(res, 'Reset password', error);
     }
   });
 

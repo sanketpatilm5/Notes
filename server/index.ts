@@ -1,5 +1,6 @@
+import 'dotenv/config';
 import express, { type Request, Response, NextFunction } from "express";
-import { registerRoutes } from "./routes";
+import { registerRoutes, seedDatabase } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
 
 const app = express();
@@ -61,11 +62,25 @@ app.use((req, res, next) => {
   // this serves both the API and the client.
   // It is the only port that is not firewalled.
   const port = parseInt(process.env.PORT || '5000', 10);
-  server.listen({
-    port,
-    host: "0.0.0.0",
-    reusePort: true,
-  }, () => {
+  // reusePort is not supported on some platforms (notably Windows). Only enable it when supported.
+  const listenOptions: any = { port, host: "0.0.0.0" };
+  if (process.platform !== 'win32') {
+    listenOptions.reusePort = true;
+  }
+  server.listen(listenOptions, () => {
     log(`serving on port ${port}`);
   });
+
+  // Optionally run DB seed on startup if SEED_DB=true (set this in env during deploy/build)
+  if (process.env.SEED_DB === 'true') {
+    (async () => {
+      try {
+        console.log('SEED_DB=true — seeding database now...');
+        await seedDatabase();
+        console.log('Seeding complete.');
+      } catch (e) {
+        console.error('Seeding failed:', e);
+      }
+    })();
+  }
 })();

@@ -33,6 +33,9 @@ export interface IStorage {
   updateNote(id: string, tenantId: string, updates: Partial<InsertNote>): Promise<Note | undefined>;
   deleteNote(id: string, tenantId: string): Promise<boolean>;
   getNotesCount(tenantId: string): Promise<number>;
+  // Returns notes for a specific tenant created by a specific user
+  getNotesByUser(tenantId: string, userId: string): Promise<Note[]>;
+
 }
 
 export class DatabaseStorage implements IStorage {
@@ -129,6 +132,16 @@ export class DatabaseStorage implements IStorage {
       .where(eq(notes.tenantId, tenantId));
     return result.count;
   }
+
+  async getNotesByUser(tenantId: string, userId: string): Promise<Note[]> {
+    const rows = await db
+      .select()
+      .from(notes)
+      .where(and(eq(notes.tenantId, tenantId), eq(notes.userId, userId)));
+    return rows as unknown as Note[];
+  }
+
+
 
   async createPasswordResetToken(insertToken: InsertPasswordResetToken): Promise<PasswordResetToken> {
     const [token] = await db.insert(passwordResetTokens).values(insertToken).returning();

@@ -9,7 +9,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useToast } from '@/hooks/use-toast';
-import { getCurrentUser, getToken, removeToken } from '@/lib/auth';
+import { getCurrentUser, removeToken } from '@/lib/auth';
 import { apiRequest, queryClient } from '@/lib/queryClient';
 import { StickyNote, Plus, Edit, Trash2, UserPlus, Star, Shield, Crown, LogOut } from 'lucide-react';
 import { Loading } from '@/components/ui/loading';
@@ -24,12 +24,13 @@ export default function Notes() {
   const [, setLocation] = useLocation();
   const { toast } = useToast();
   const user = getCurrentUser();
-  
+
   // Modal states
   const [noteModalOpen, setNoteModalOpen] = useState(false);
   const [inviteModalOpen, setInviteModalOpen] = useState(false);
+  const [upgradeModalOpen, setUpgradeModalOpen] = useState(false);
   const [editingNote, setEditingNote] = useState<Note | null>(null);
-  
+
   // Form states
   const [noteForm, setNoteForm] = useState<NoteFormData>({ title: '', content: '' });
   const [inviteForm, setInviteForm] = useState({ email: '', role: 'member' });
@@ -45,10 +46,19 @@ export default function Notes() {
     return <Loading />;
   }
 
-  // Fetch notes
-  const { data: notes = [], isLoading: notesLoading, refetch } = useQuery<Note[]>({
-    queryKey: ['/api/notes'],
+  // Fetch notes (user-scoped cache key + explicit queryFn)
+  const {
+    data: notes = [],
+    isLoading: notesLoading,
+    refetch: refetchNotes
+  } = useQuery<Note[]>({
+    // scoped per-user so different users in same tenant don't share cache
+    queryKey: ['userNotes', user?.userId],
     enabled: !!user,
+    queryFn: async () => {
+      const res = await apiRequest('GET', '/api/notes');
+      return (await res.json()) as Note[];
+    },
   });
 
   // Fetch tenant info
@@ -57,78 +67,89 @@ export default function Notes() {
     enabled: !!user,
   });
 
-  // Create note mutation
+  // Plan info
+  const isFreePlan = tenant?.plan === 'free' || !tenant?.plan;
+  const planLimit = isFreePlan ? 3 : Infinity;
+  const notesCount = notes.length;
+  const isAtOrOverLimit = isFreePlan && notesCount >= planLimit;
+
+  // --- Mutations ---
   const createNoteMutation = useMutation({
     mutationFn: (data: NoteFormData) => apiRequest('POST', '/api/notes', data),
-    onSuccess: () => {
+    onSuccess: async (res) => {
+      // apiRequest returns Response — parse it if needed
+      let data;
+      try { data = await res.json(); } catch { data = null; }
+      console.log("Create note response:", data);
       toast({ title: "Success", description: "Note created successfully!" });
       setNoteModalOpen(false);
       setNoteForm({ title: '', content: '' });
-      queryClient.invalidateQueries({ queryKey: ['/api/notes'] });
+      try { queryClient.invalidateQueries({ queryKey: ['userNotes', user?.userId] }); } catch (e) {}
+      refetchNotes();
+      try { queryClient.invalidateQueries({ queryKey: [`/api/tenants/${user.tenantSlug}`] }); } catch (e) {}
     },
-    onError: (error: any) => {
-      toast({
-        title: "Error",
-        description: error.message || "Failed to create note",
-        variant: "destructive",
-      });
+    onError: async (error: any) => {
+      try {
+        if (error instanceof Response) {
+          const text = await error.text();
+          console.error('Create note failed - server response:', text);
+          toast({ title: "Error", description: text || "Failed to create note", variant: "destructive" });
+          return;
+        }
+      } catch (_) {}
+      const msg = error?.message || error?.response?.data?.message || "Failed to create note";
+      if (msg.includes("Free plan limit")) {
+        toast({ title: "Plan limit reached", description: msg, variant: "destructive" });
+        setUpgradeModalOpen(true);
+      } else {
+        toast({ title: "Error", description: msg, variant: "destructive" });
+      }
     },
   });
 
-  // Update note mutation
   const updateNoteMutation = useMutation({
     mutationFn: ({ id, data }: { id: string; data: NoteFormData }) =>
       apiRequest('PUT', `/api/notes/${id}`, data),
-    onSuccess: () => {
+    onSuccess: async (res) => {
+      try { await res.json(); } catch {}
       toast({ title: "Success", description: "Note updated successfully!" });
       setNoteModalOpen(false);
       setEditingNote(null);
       setNoteForm({ title: '', content: '' });
-      queryClient.invalidateQueries({ queryKey: ['/api/notes'] });
+      try { queryClient.invalidateQueries({ queryKey: ['userNotes', user?.userId] }); } catch (e) {}
+      refetchNotes();
     },
     onError: (error: any) => {
-      toast({
-        title: "Error",
-        description: error.message || "Failed to update note",
-        variant: "destructive",
-      });
+      toast({ title: "Error", description: error.message || "Failed to update note", variant: "destructive" });
     },
   });
 
-  // Delete note mutation
   const deleteNoteMutation = useMutation({
     mutationFn: (id: string) => apiRequest('DELETE', `/api/notes/${id}`),
-    onSuccess: () => {
+    onSuccess: async () => {
       toast({ title: "Success", description: "Note deleted successfully!" });
-      queryClient.invalidateQueries({ queryKey: ['/api/notes'] });
+      try { queryClient.invalidateQueries({ queryKey: ['userNotes', user?.userId] }); } catch (e) {}
+      refetchNotes();
     },
     onError: (error: any) => {
-      toast({
-        title: "Error",
-        description: error.message || "Failed to delete note",
-        variant: "destructive",
-      });
+      toast({ title: "Error", description: error.message || "Failed to delete note", variant: "destructive" });
     },
   });
 
-  // Upgrade tenant mutation
   const upgradeMutation = useMutation({
     mutationFn: () => apiRequest('POST', `/api/tenants/${user.tenantSlug}/upgrade`, {}),
     onSuccess: () => {
       toast({ title: "Success", description: "Upgraded to Pro plan!" });
+      setUpgradeModalOpen(false);
       queryClient.invalidateQueries({ queryKey: [`/api/tenants/${user.tenantSlug}`] });
-      window.location.reload(); // Refresh to get new JWT with updated plan
+      try { queryClient.invalidateQueries({ queryKey: ['userNotes', user?.userId] }); } catch(e){}
+      window.location.reload();
     },
     onError: (error: any) => {
-      toast({
-        title: "Error",
-        description: error.message || "Failed to upgrade",
-        variant: "destructive",
-      });
+      toast({ title: "Error", description: error.message || "Failed to upgrade", variant: "destructive" });
     },
   });
 
-  // Invite user mutation
   const inviteMutation = useMutation({
     mutationFn: (data: { email: string; role: string }) =>
       apiRequest('POST', `/api/tenants/${user.tenantSlug}/invite`, data),
@@ -138,20 +159,24 @@ export default function Notes() {
       setInviteForm({ email: '', role: 'member' });
     },
     onError: (error: any) => {
-      toast({
-        title: "Error",
-        description: error.message || "Failed to invite user",
-        variant: "destructive",
-      });
+      toast({ title: "Error", description: error.message || "Failed to invite user", variant: "destructive" });
     },
   });
 
+  // --- Handlers ---
   const handleLogout = () => {
     removeToken();
+    // clear any user-specific caches on logout
+    try { queryClient.removeQueries({ queryKey: ['userNotes', user?.userId] }); } catch {}
     setLocation('/login');
   };
 
   const handleCreateNote = () => {
+    if (isAtOrOverLimit) {
+      toast({ title: "Plan limit reached", description: "Upgrade to Pro to create more notes.", variant: "destructive" });
+      setUpgradeModalOpen(true);
+      return;
+    }
     setEditingNote(null);
     setNoteForm({ title: '', content: '' });
     setNoteModalOpen(true);
@@ -183,12 +208,6 @@ export default function Notes() {
     inviteMutation.mutate(inviteForm);
   };
 
-  // Calculate plan info
-  const planLimit = 3; // Free plan limit
-  const notesCount = notes.length;
-  const isFreePlan = true; // We'll get this from tenant data when available
-  const showPlanWarning = isFreePlan && notesCount >= planLimit - 1;
-
   if (notesLoading) {
     return <Loading />;
   }
@@ -199,7 +218,6 @@ export default function Notes() {
       <header className="bg-card border-b border-border shadow-sm">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
           <div className="flex items-center justify-between">
-            {/* Left side - Logo and tenant info */}
             <div className="flex items-center space-x-4">
               <div className="w-10 h-10 bg-primary rounded-lg flex items-center justify-center">
                 <StickyNote className="text-lg text-primary-foreground" size={20} />
@@ -211,47 +229,32 @@ export default function Notes() {
                   <span className="w-1 h-1 bg-muted-foreground rounded-full"></span>
                   <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-amber-100 text-amber-800">
                     <Crown className="text-xs mr-1" size={12} />
-                    Free Plan
+                    {isFreePlan ? 'Free Plan' : 'Pro Plan'}
                   </span>
                 </div>
               </div>
             </div>
-
-            {/* Right side - User info and actions */}
             <div className="flex items-center space-x-4">
-              {/* Plan Upgrade CTA */}
               {isFreePlan && (
                 <Button
                   variant="outline"
-                  className="hidden sm:inline-flex items-center text-primary bg-primary/10 hover:bg-primary/20"
-                  onClick={() => upgradeMutation.mutate()}
+                  onClick={() => setUpgradeModalOpen(true)}
                   disabled={upgradeMutation.isPending}
-                  data-testid="button-upgrade"
                 >
                   <Star className="text-xs mr-2" size={12} />
                   Upgrade to Pro
                 </Button>
               )}
-
-              {/* User info */}
               <div className="flex items-center space-x-3">
                 <div className="text-right text-sm">
                   <div className="text-foreground font-medium">{user.email}</div>
-                  <div className="flex items-center space-x-1">
-                    <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">
-                      <Shield className="text-xs mr-1" size={12} />
-                      {user.role}
-                    </span>
-                  </div>
+                  <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                    <Shield className="text-xs mr-1" size={12} />
+                    {user.role}
+                  </span>
                 </div>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={handleLogout}
-                  className="w-8 h-8 p-0"
-                  data-testid="button-logout"
-                >
-                  <LogOut className="text-sm" size={16} />
+                <Button variant="ghost" size="sm" onClick={handleLogout}>
+                  <LogOut size={16} />
                 </Button>
               </div>
             </div>
@@ -259,133 +262,64 @@ export default function Notes() {
         </div>
       </header>
 
-      {/* Main Content */}
+      {/* Main */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {/* Page Title and Actions */}
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-8">
           <div>
-            <h2 className="text-2xl font-bold text-foreground mb-2">My Notes</h2>
+            <h2 className="text-2xl font-bold">My Notes</h2>
             <div className="flex items-center space-x-4 text-sm text-muted-foreground">
-              <span data-testid="text-notes-count">{notesCount} of {isFreePlan ? planLimit : '∞'} notes used</span>
-              <span className="w-1 h-1 bg-muted-foreground rounded-full"></span>
-              <span>{isFreePlan ? 'Free plan limit' : 'Pro plan'}</span>
+              <span>{notesCount} of {isFreePlan ? planLimit : '∞'} notes used</span>
+              <span>{isFreePlan ? 'Free plan (per user)' : 'Pro plan'}</span>
             </div>
           </div>
-          
           <div className="mt-4 sm:mt-0 flex space-x-3">
-            {/* Admin-only invite button */}
             {user.role === 'admin' && (
-              <Button
-                variant="outline"
-                onClick={() => setInviteModalOpen(true)}
-                data-testid="button-invite"
-              >
-                <UserPlus className="text-sm mr-2" size={16} />
+              <Button variant="outline" onClick={() => setInviteModalOpen(true)}>
+                <UserPlus className="mr-2" size={16} />
                 Invite User
               </Button>
             )}
-            
-            <Button 
-              onClick={handleCreateNote}
-              className="bg-primary text-primary-foreground hover:bg-primary/90"
-              data-testid="button-create-note"
-            >
-              <Plus className="text-sm mr-2" size={16} />
+            <Button onClick={handleCreateNote}>
+              <Plus className="mr-2" size={16} />
               New Note
             </Button>
           </div>
         </div>
 
-        {/* Plan Limit Warning */}
-        {showPlanWarning && (
-          <Card className="bg-amber-50 border-amber-200 mb-6">
-            <CardContent className="pt-4">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center">
-                  <div className="text-amber-500 mr-3">⚠️</div>
-                  <div>
-                    <h3 className="text-sm font-medium text-amber-800">Approaching Plan Limit</h3>
-                    <p className="text-sm text-amber-700 mt-1">
-                      You're using {notesCount} of {planLimit} available notes on your free plan.
-                    </p>
-                  </div>
-                </div>
-                <Button
-                  className="bg-amber-600 text-white hover:bg-amber-700"
-                  onClick={() => upgradeMutation.mutate()}
-                  disabled={upgradeMutation.isPending}
-                >
-                  Upgrade Now
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        )}
-
         {/* Notes Grid */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           {notes.map((note) => (
-            <Card key={note.id} className="hover:shadow-md transition-shadow" data-testid={`card-note-${note.id}`}>
+            <Card key={note.id}>
               <CardContent className="pt-6">
                 <div className="flex items-start justify-between mb-3">
-                  <h3 className="text-lg font-medium text-foreground truncate" data-testid={`text-note-title-${note.id}`}>
-                    {note.title}
-                  </h3>
-                  <div className="flex items-center space-x-1 ml-2">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => handleEditNote(note)}
-                      className="w-8 h-8 p-0"
-                      data-testid={`button-edit-${note.id}`}
-                    >
-                      <Edit className="text-sm" size={14} />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => handleDeleteNote(note.id)}
-                      className="w-8 h-8 p-0 hover:bg-destructive/10 hover:text-destructive"
-                      data-testid={`button-delete-${note.id}`}
-                    >
-                      <Trash2 className="text-sm" size={14} />
-                    </Button>
+                  <h3 className="text-lg font-medium truncate">{note.title}</h3>
+                  <div className="flex space-x-1">
+                    {(note.userId === user.userId) && (
+                      <>
+                        <Button variant="ghost" size="sm" onClick={() => handleEditNote(note)}>
+                          <Edit size={14} />
+                        </Button>
+                        <Button variant="ghost" size="sm" onClick={() => handleDeleteNote(note.id)}>
+                          <Trash2 size={14} />
+                        </Button>
+                      </>
+                    )}
                   </div>
                 </div>
-                <p className="text-muted-foreground text-sm line-clamp-3 mb-4" data-testid={`text-note-content-${note.id}`}>
-                  {note.content}
-                </p>
-                <div className="flex items-center justify-between text-xs text-muted-foreground">
-                  <span>{new Date(note.updatedAt).toLocaleDateString()}</span>
+                <p className="text-muted-foreground text-sm line-clamp-3 mb-4">{note.content}</p>
+                <div className="text-xs text-muted-foreground">
+                  {note.updatedAt ? new Date(note.updatedAt).toLocaleDateString() : ''}
                 </div>
               </CardContent>
             </Card>
           ))}
-
-          {/* Create New Note Card */}
-          <Card 
-            className="border-2 border-dashed border-border hover:border-primary transition-colors cursor-pointer min-h-[180px] flex items-center justify-center"
-            onClick={handleCreateNote}
-            data-testid="card-create-note"
-          >
-            <CardContent className="text-center text-muted-foreground hover:text-primary transition-colors">
-              <Plus className="text-3xl mb-3 mx-auto" size={48} />
-              <h3 className="text-lg font-medium mb-1">Create New Note</h3>
-              <p className="text-sm">Add a new note to your collection</p>
-            </CardContent>
-          </Card>
         </div>
 
-        {/* Empty State */}
         {notes.length === 0 && (
-          <div className="text-center py-12" data-testid="empty-state">
-            <div className="w-24 h-24 bg-muted rounded-full flex items-center justify-center mx-auto mb-4">
-              <StickyNote className="text-3xl text-muted-foreground" size={48} />
-            </div>
-            <h3 className="text-lg font-medium text-foreground mb-2">No notes yet</h3>
-            <p className="text-muted-foreground mb-6">Create your first note to get started</p>
-            <Button onClick={handleCreateNote} className="bg-primary text-primary-foreground hover:bg-primary/90">
-              <Plus className="text-sm mr-2" size={16} />
+          <div className="text-center py-12">
+            <h3 className="text-lg font-medium mb-2">No notes yet</h3>
+            <Button onClick={handleCreateNote}>
+              <Plus className="mr-2" size={16} />
               Create First Note
             </Button>
           </div>
@@ -394,47 +328,30 @@ export default function Notes() {
 
       {/* Note Modal */}
       <Dialog open={noteModalOpen} onOpenChange={setNoteModalOpen}>
-        <DialogContent className="max-w-2xl" data-testid="modal-note">
+        <DialogContent className="max-w-2xl">
           <DialogHeader>
             <DialogTitle>{editingNote ? 'Edit Note' : 'Create New Note'}</DialogTitle>
           </DialogHeader>
-          
-          <form onSubmit={handleNoteSubmit} className="space-y-4" data-testid="form-note">
+          <form onSubmit={handleNoteSubmit} className="space-y-4">
             <div>
-              <Label htmlFor="note-title">Title</Label>
+              <Label>Title</Label>
               <Input
-                id="note-title"
                 value={noteForm.title}
                 onChange={(e) => setNoteForm(prev => ({ ...prev, title: e.target.value }))}
-                placeholder="Enter note title..."
                 required
-                data-testid="input-note-title"
               />
             </div>
-            
             <div>
-              <Label htmlFor="note-content">Content</Label>
+              <Label>Content</Label>
               <Textarea
-                id="note-content"
                 value={noteForm.content}
                 onChange={(e) => setNoteForm(prev => ({ ...prev, content: e.target.value }))}
-                placeholder="Write your note content here..."
-                rows={10}
-                className="resize-vertical"
                 required
-                data-testid="textarea-note-content"
               />
             </div>
-            
             <div className="flex justify-end space-x-3 pt-4">
-              <Button type="button" variant="outline" onClick={() => setNoteModalOpen(false)}>
-                Cancel
-              </Button>
-              <Button 
-                type="submit" 
-                disabled={createNoteMutation.isPending || updateNoteMutation.isPending}
-                data-testid="button-save-note"
-              >
+              <Button type="button" variant="outline" onClick={() => setNoteModalOpen(false)}>Cancel</Button>
+              <Button type="submit" disabled={createNoteMutation.isLoading || updateNoteMutation.isLoading}>
                 {editingNote ? 'Update Note' : 'Save Note'}
               </Button>
             </div>
@@ -445,58 +362,54 @@ export default function Notes() {
       {/* Invite Modal */}
       {user.role === 'admin' && (
         <Dialog open={inviteModalOpen} onOpenChange={setInviteModalOpen}>
-          <DialogContent data-testid="modal-invite">
+          <DialogContent>
             <DialogHeader>
               <DialogTitle>Invite New User</DialogTitle>
             </DialogHeader>
-            
-            <form onSubmit={handleInviteSubmit} className="space-y-4" data-testid="form-invite">
+            <form onSubmit={handleInviteSubmit} className="space-y-4">
               <div>
-                <Label htmlFor="invite-email">Email Address</Label>
+                <Label>Email</Label>
                 <Input
-                  id="invite-email"
                   type="email"
                   value={inviteForm.email}
                   onChange={(e) => setInviteForm(prev => ({ ...prev, email: e.target.value }))}
-                  placeholder="user@example.com"
                   required
-                  data-testid="input-invite-email"
                 />
               </div>
-              
               <div>
-                <Label htmlFor="invite-role">Role</Label>
-                <Select value={inviteForm.role} onValueChange={(value) => setInviteForm(prev => ({ ...prev, role: value }))}>
-                  <SelectTrigger data-testid="select-invite-role">
-                    <SelectValue />
-                  </SelectTrigger>
+                <Label>Role</Label>
+                <Select value={inviteForm.role} onValueChange={(v) => setInviteForm(prev => ({ ...prev, role: v }))}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="member">Member</SelectItem>
                     <SelectItem value="admin">Admin</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
-              
-              <Card className="bg-muted">
-                <CardContent className="pt-3">
-                  <p className="text-sm text-muted-foreground">
-                    ℹ️ An email with password setup instructions will be sent to the user.
-                  </p>
-                </CardContent>
-              </Card>
-              
               <div className="flex justify-end space-x-3 pt-4">
-                <Button type="button" variant="outline" onClick={() => setInviteModalOpen(false)}>
-                  Cancel
-                </Button>
-                <Button type="submit" disabled={inviteMutation.isPending} data-testid="button-send-invite">
-                  Send Invite
-                </Button>
+                <Button type="button" variant="outline" onClick={() => setInviteModalOpen(false)}>Cancel</Button>
+                <Button type="submit" disabled={inviteMutation.isLoading}>Send Invite</Button>
               </div>
             </form>
           </DialogContent>
         </Dialog>
       )}
+
+      {/* Upgrade Modal */}
+      <Dialog open={upgradeModalOpen} onOpenChange={setUpgradeModalOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Upgrade to Pro</DialogTitle>
+          </DialogHeader>
+          <p>Your free plan is limited to {planLimit} notes. Upgrade to Pro for unlimited notes.</p>
+          <div className="flex justify-end space-x-3 pt-4">
+            <Button type="button" variant="outline" onClick={() => setUpgradeModalOpen(false)}>Cancel</Button>
+            <Button onClick={() => upgradeMutation.mutate()} disabled={upgradeMutation.isLoading}>
+              {upgradeMutation.isLoading ? "Upgrading..." : "Upgrade Now"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

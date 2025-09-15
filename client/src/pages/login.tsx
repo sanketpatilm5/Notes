@@ -27,6 +27,8 @@ export default function Login() {
       const data = await response.json();
       
       setToken(data.token);
+      // clear react-query cache so data is refetched under the new tenant context
+      try { queryClient.invalidateQueries(); } catch (e) { /* ignore */ }
       toast({
         title: "Success",
         description: "Login successful!",
