@@ -8,6 +8,7 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
+// Request logging middleware
 app.use((req, res, next) => {
   const start = Date.now();
   const pathUrl = req.path;
@@ -39,6 +40,7 @@ app.use((req, res, next) => {
 (async () => {
   const server = await registerRoutes(app);
 
+  // Error handler
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
     const status = err.status || err.statusCode || 500;
     const message = err.message || "Internal Server Error";
@@ -69,15 +71,12 @@ app.use((req, res, next) => {
 
   const port = parseInt(process.env.PORT || '5000', 10);
 
-  // --- Key change: Export handler for Vercel instead of always listening ---
   if (process.env.VERCEL === '1' || process.env.VERCEL === 'true') {
     // For Vercel serverless: export app
     module.exports = app;
-    // also export default for ESM
-    export default app;
     log("Exported Express app for Vercel serverless");
   } else {
-    // Local/dev run: start server
+    // Local/dev run: start server normally
     const listenOptions: any = { port, host: "0.0.0.0" };
     if (process.platform !== 'win32') {
       listenOptions.reusePort = true;
@@ -86,6 +85,7 @@ app.use((req, res, next) => {
       log(`serving on port ${port}`);
     });
 
+    // Optionally run DB seed locally
     if (process.env.SEED_DB === 'true') {
       (async () => {
         try {
